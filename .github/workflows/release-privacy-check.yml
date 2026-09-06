@@ -1,0 +1,89 @@
+name: Release privacy check
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-privacy-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live-supabase-rls:
+    name: Live Supabase RLS (required)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: supabase-rls-test
+    env:
+      SUPABASE_RLS_REQUIRED: "true"
+      SUPABASE_TEST_URL: ${{ secrets.SUPABASE_TEST_URL }}
+      SUPABASE_TEST_ANON_KEY: ${{ secrets.SUPABASE_TEST_ANON_KEY }}
+      SUPABASE_TEST_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_TEST_SERVICE_ROLE_KEY }}
+      SUPABASE_TEST_DATABASE_URL: ${{ secrets.SUPABASE_TEST_DATABASE_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.25.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install --yes postgresql-client
+
+      - name: Verify protected test configuration
+        shell: bash
+        run: |
+          missing=()
+          for name in \
+            SUPABASE_TEST_URL \
+            SUPABASE_TEST_ANON_KEY \
+            SUPABASE_TEST_SERVICE_ROLE_KEY \
+            SUPABASE_TEST_DATABASE_URL
+          do
+            if [[ -z "${!name}" ]]; then
+              missing+=("$name")
+            else
+              echo "::add-mask::${!name}"
+            fi
+          done
+          if (( ${#missing[@]} )); then
+            printf 'Missing protected environment secrets: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Install locked dependencies
+        run: pnpm install --filter @workspace/api-server... --no-frozen-lockfile
+
+      - name: Run live privacy checks
+        id: rls
+        shell: bash
+        run: |
+          set +e
+          pnpm --filter @workspace/api-server test:supabase-rls >"$RUNNER_TEMP/supabase-rls.raw.log" 2>&1
+          status=$?
+          node scripts/redact-ci-log.mjs \
+            "$RUNNER_TEMP/supabase-rls.raw.log" \
+            "$RUNNER_TEMP/supabase-rls.log"
+          rm -f "$RUNNER_TEMP/supabase-rls.raw.log"
+          exit "$status"
+
+      - name: Retain redacted failure log
+        if: failure() && steps.rls.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: supabase-rls-failure-${{ github.run_id }}
+          path: ${{ runner.temp }}/supabase-rls.log
+          if-no-files-found: error
+          retention-days: 14
